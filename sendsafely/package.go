@@ -242,11 +242,21 @@ func (p *Package) Open(fileName string) (*File, error) {
 		nominalSize = len(c1)
 	}
 
-	// Pre-fetch last chunk to verify file size
+	// Pre-fetch last chunk to verify file size. The API may report trailing
+	// empty chunks; strip them so the last chunk reflects actual data.
 	if parts > 2 {
 		cLast, err := p.fetchAndDecrypt(chunkIDs[parts-1])
 		if err != nil {
 			return nil, fmt.Errorf("failed to download last chunk: %w", err)
+		}
+		for len(cLast) == 0 && parts > 2 {
+			delete(prefetched, parts-1)
+			parts--
+			chunkIDs = chunkIDs[:parts]
+			cLast, err = p.fetchAndDecrypt(chunkIDs[parts-1])
+			if err != nil {
+				return nil, fmt.Errorf("failed to download last chunk: %w", err)
+			}
 		}
 		prefetched[parts-1] = cLast
 
@@ -323,7 +333,8 @@ func (p *Package) fetchAndDecrypt(url ID) ([]byte, error) {
 // DownloadFile downloads a file from the package to the specified output path.
 // It supports resumption: if a partial download exists (.ssget-tmp file), it will
 // resume from where it left off (with a 4MB safety margin for torn blocks).
-func (p *Package) DownloadFile(fileName, outputPath string, progress func(string, int, float64),
+func (p *Package) DownloadFile(
+	fileName, outputPath string, progress func(string, int, float64),
 ) error {
 	if progress != nil {
 		progress("fetching metadata", 0, 0)

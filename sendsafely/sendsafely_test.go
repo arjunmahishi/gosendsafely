@@ -21,9 +21,9 @@ import (
 // mockSendSafelyServer creates a test server that simulates the SendSafely API.
 type mockSendSafelyServer struct {
 	*httptest.Server
-	packages      map[string]*mockPackage
-	userEmail     string
-	validAPIKey   string
+	packages       map[string]*mockPackage
+	userEmail      string
+	validAPIKey    string
 	validAPISecret string
 }
 
@@ -561,6 +561,13 @@ func TestPackage_DownloadFile_MultipleChunks(t *testing.T) {
 	chunk3 := bytes.Repeat([]byte("CHUNK3"), 100)
 	fullContent := append(append(chunk1, chunk2...), chunk3...)
 
+	// Second file with a trailing empty chunk, simulating the API reporting
+	// more parts than actually contain data.
+	chunk4 := bytes.Repeat([]byte("CHUNK4"), 200)
+	chunk5 := bytes.Repeat([]byte("CHUNK5"), 200)
+	chunk6 := bytes.Repeat([]byte("CHUNK6"), 100)
+	fullContent2 := append(append(chunk4, chunk5...), chunk6...)
+
 	pkg := &mockPackage{
 		packageID:    "pkg-123",
 		packageCode:  "TESTCODE",
@@ -568,6 +575,7 @@ func TestPackage_DownloadFile_MultipleChunks(t *testing.T) {
 		keyCode:      "key-code-456",
 		files: []mockFile{
 			{fileID: "file-1", fileName: "multi-chunk.bin", fileSize: len(fullContent), parts: 3, chunks: [][]byte{chunk1, chunk2, chunk3}},
+			{fileID: "file-2", fileName: "trailing-empty.bin", fileSize: len(fullContent2), parts: 4, chunks: [][]byte{chunk4, chunk5, chunk6, {}}},
 		},
 	}
 	server.addPackage(pkg)
@@ -591,21 +599,39 @@ func TestPackage_DownloadFile_MultipleChunks(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	outputPath := filepath.Join(tmpDir, "multi-chunk.bin")
+	t.Run("multiple chunks well formed", func(t *testing.T) {
+		outputPath := filepath.Join(tmpDir, "multi-chunk.bin")
+		err = result.DownloadFile("multi-chunk.bin", outputPath, nil)
+		if err != nil {
+			t.Fatalf("DownloadFile failed: %v", err)
+		}
 
-	err = result.DownloadFile("multi-chunk.bin", outputPath, nil)
-	if err != nil {
-		t.Fatalf("DownloadFile failed: %v", err)
-	}
+		downloadedContent, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("Failed to read downloaded file: %v", err)
+		}
 
-	downloadedContent, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatalf("Failed to read downloaded file: %v", err)
-	}
+		if !bytes.Equal(downloadedContent, fullContent) {
+			t.Errorf("Downloaded content doesn't match original. Got %d bytes, expected %d bytes", len(downloadedContent), len(fullContent))
+		}
+	})
 
-	if !bytes.Equal(downloadedContent, fullContent) {
-		t.Errorf("Downloaded content doesn't match original. Got %d bytes, expected %d bytes", len(downloadedContent), len(fullContent))
-	}
+	t.Run("with trailing empty chunk", func(t *testing.T) {
+		outputPath2 := filepath.Join(tmpDir, "trailing-empty.bin")
+		err = result.DownloadFile("trailing-empty.bin", outputPath2, nil)
+		if err != nil {
+			t.Fatalf("DownloadFile failed for trailing empty chunk file: %v", err)
+		}
+
+		downloadedContent2, err := os.ReadFile(outputPath2)
+		if err != nil {
+			t.Fatalf("Failed to read downloaded file: %v", err)
+		}
+
+		if !bytes.Equal(downloadedContent2, fullContent2) {
+			t.Errorf("Downloaded content doesn't match original. Got %d bytes, expected %d bytes", len(downloadedContent2), len(fullContent2))
+		}
+	})
 }
 
 // TestCredentials_Validate tests credential validation.
