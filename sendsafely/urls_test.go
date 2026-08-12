@@ -2,11 +2,17 @@ package sendsafely
 
 import (
 	"bytes"
+	"crypto/pbkdf2"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dt/gosendsafely/util"
 )
@@ -175,6 +181,132 @@ func TestDownload_FatalErrorFailsFast(t *testing.T) {
 	if n := len(server.mintCalls()); n != 1 {
 		t.Errorf("minted %d times, want 1 (a fatal error must not trigger a refresh)", n)
 	}
+}
+
+// fakeURLTable builds a table whose minting is driven by the test rather than
+// by an API, so the ordering between concurrent callers is controllable.
+func fakeURLTable(parts int, mint func(start, end int) ([]ID, error)) *urlTable {
+	return &urlTable{
+		mintBatch: mint,
+		parts:     parts,
+		urls:      make([]ID, parts),
+		batches:   make(map[int]*urlBatch),
+	}
+}
+
+// TestURLTable_FailedRefreshSparesValidURL covers a cross-segment failure: one
+// segment's URL expires and its re-mint fails for a passing reason, while a
+// second segment in the same batch is merely asking for a URL it could already
+// have. The second must not inherit the first's error — every fetch failure
+// cancels the whole download, so one segment's blip would sink all of it.
+func TestURLTable_FailedRefreshSparesValidURL(t *testing.T) {
+	var (
+		entered = make(chan struct{}, 4)
+		release = make(chan error)
+		calls   atomic.Int32
+	)
+	tbl := fakeURLTable(4, func(start, end int) ([]ID, error) {
+		n := calls.Add(1)
+		entered <- struct{}{}
+		if err := <-release; err != nil {
+			return nil, err
+		}
+		urls := make([]ID, end-start)
+		for i := range urls {
+			urls[i] = ID(fmt.Sprintf("url-%d-mint%d", start+i, n))
+		}
+		return urls, nil
+	})
+
+	// First mint succeeds, so every segment in the batch has a usable URL.
+	go func() { release <- nil }()
+	_, gen, err := tbl.url(0)
+	if err != nil {
+		t.Fatalf("initial mint: %v", err)
+	}
+	<-entered
+
+	// Segment 0's URL expired; its refresh is in flight and about to fail.
+	refreshed := make(chan error, 1)
+	go func() {
+		_, _, err := tbl.refresh(0, gen)
+		refreshed <- err
+	}()
+	<-entered
+
+	// Segment 1 now wants a URL. The one in the table is new enough, but the
+	// failing mint is in flight, so it lands in the waiting path.
+	type result struct {
+		url ID
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		u, _, err := tbl.url(1)
+		got <- result{u, err}
+	}()
+	time.Sleep(50 * time.Millisecond) // let segment 1 reach the wait
+
+	release <- errors.New("mint unavailable")
+
+	if err := <-refreshed; err == nil {
+		t.Error("refresh of the expired URL should have failed")
+	}
+	r := <-got
+	if r.err != nil {
+		t.Errorf("segment 1 failed with another segment's refresh error: %v", r.err)
+	}
+	if r.url != "url-1-mint1" {
+		t.Errorf("segment 1 got URL %q, want the still-valid url-1-mint1", r.url)
+	}
+}
+
+// TestFetchSegment_RetriesFailedMint checks the other half of that failure: the
+// segment whose refresh genuinely failed retries the mint instead of taking the
+// download down with it.
+func TestFetchSegment_RetriesFailedMint(t *testing.T) {
+	server := newMockSendSafelyServer()
+	defer server.Close()
+
+	file := bigMockFile(4, 16)
+	p := openTestPackage(t, server, &mockPackage{
+		packageID:    "pkg-123",
+		packageCode:  "TESTCODE",
+		serverSecret: "server-secret-123",
+		keyCode:      "key-code-456",
+		files:        []mockFile{file},
+	})
+
+	// The first mint fails; a retry succeeds.
+	var calls atomic.Int32
+	real := newURLTable(p, file.fileID, checksumFor(t, p), file.parts)
+	tbl := fakeURLTable(file.parts, func(start, end int) ([]ID, error) {
+		if calls.Add(1) == 1 {
+			return nil, errors.New("mint unavailable")
+		}
+		return real.mintBatch(start, end)
+	})
+
+	data, err := p.fetchSegment(tbl, 0)
+	if err != nil {
+		t.Fatalf("fetchSegment gave up on a retryable mint failure: %v", err)
+	}
+	if !bytes.Equal(data, file.chunks[0]) {
+		t.Errorf("segment 0 content mismatch")
+	}
+	if n := calls.Load(); n != 2 {
+		t.Errorf("mint called %d times, want 2 (one failure, one retry)", n)
+	}
+}
+
+// checksumFor derives the per-package checksum the download-urls API expects.
+func checksumFor(t *testing.T, p *Package) string {
+	t.Helper()
+	dk, err := pbkdf2.Key(sha256.New, p.keyCode, []byte(p.info.PackageCode), 1024, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(dk)
 }
 
 // TestURLTable_RefreshCollapses checks the generation handshake directly: two

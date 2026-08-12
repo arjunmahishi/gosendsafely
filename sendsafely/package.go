@@ -286,14 +286,38 @@ const (
 // fetchSegment downloads and decrypts one segment, re-minting its presigned URL
 // if the signature has expired. Expiry is expected on long downloads: every URL
 // carries a deadline, and a multi-GB file can outlive it.
+//
+// A failure here cancels the whole download, so anything that might be
+// temporary — a 5xx from either endpoint, a network blip, a mint that lost a
+// race — is retried rather than surfaced.
 func (p *Package) fetchSegment(t *urlTable, i int) ([]byte, error) {
-	url, gen, err := t.url(i)
-	if err != nil {
-		return nil, fmt.Errorf("segment %d: %w", i+1, err)
-	}
+	var (
+		url ID
+		gen int
+		// needGen is the generation the URL must have been minted at. It moves
+		// past the current one when a signature expires.
+		needGen   = 1
+		attempts  int // transient failures spent
+		refreshes int // expired URLs replaced
+	)
 
-	attempts, refreshes := 0, 0
 	for {
+		if gen < needGen {
+			u, g, err := t.mint(i, needGen)
+			if err != nil {
+				// Minting can fail for reasons that pass: the API 5xx'd, or
+				// another segment's refresh of this batch failed and we're
+				// seeing its error. Spend an attempt, not the download.
+				attempts++
+				if attempts == maxFetchAttempts {
+					return nil, fmt.Errorf("segment %d: get download URL: %w", i+1, err)
+				}
+				time.Sleep(backoff(attempts))
+				continue
+			}
+			url, gen = u, g
+		}
+
 		data, err := p.client.fetchAttempt(url)
 		if err == nil {
 			return p.decrypt(data)
@@ -307,10 +331,7 @@ func (p *Package) fetchSegment(t *urlTable, i int) ([]byte, error) {
 				return nil, fmt.Errorf("segment %d: still failing after %d URL refreshes: %w", i+1, refreshes, err)
 			}
 			refreshes++
-			url, gen, err = t.refresh(i, gen)
-			if err != nil {
-				return nil, fmt.Errorf("segment %d: refresh download URL: %w", i+1, err)
-			}
+			needGen = gen + 1
 		case errors.As(err, &he) && he.fatal():
 			return nil, fmt.Errorf("segment %d: %w", i+1, err)
 		default:
@@ -318,9 +339,13 @@ func (p *Package) fetchSegment(t *urlTable, i int) ([]byte, error) {
 			if attempts == maxFetchAttempts {
 				return nil, fmt.Errorf("segment %d: %w", i+1, err)
 			}
-			time.Sleep(min(time.Second<<attempts, 8*time.Second))
+			time.Sleep(backoff(attempts))
 		}
 	}
+}
+
+func backoff(attempt int) time.Duration {
+	return min(time.Second<<attempt, 8*time.Second)
 }
 
 func (p *Package) decrypt(data []byte) ([]byte, error) {

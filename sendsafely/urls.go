@@ -22,10 +22,9 @@ const urlBatchSize = 64
 //
 // Segment indices are zero-based here; the API numbers them from one.
 type urlTable struct {
-	p        *Package
-	fileID   string
-	checksum string
-	parts    int
+	// mintBatch mints presigned URLs for segments [start, end).
+	mintBatch func(start, end int) ([]ID, error)
+	parts     int
 
 	mu      sync.Mutex
 	urls    []ID
@@ -46,12 +45,12 @@ type urlBatch struct {
 
 func newURLTable(p *Package, fileID, checksum string, parts int) *urlTable {
 	return &urlTable{
-		p:        p,
-		fileID:   fileID,
-		checksum: checksum,
-		parts:    parts,
-		urls:     make([]ID, parts),
-		batches:  make(map[int]*urlBatch),
+		mintBatch: func(start, end int) ([]ID, error) {
+			return p.fetchURLs(fileID, checksum, start, end)
+		},
+		parts:   parts,
+		urls:    make([]ID, parts),
+		batches: make(map[int]*urlBatch),
 	}
 }
 
@@ -92,11 +91,16 @@ func (t *urlTable) mint(i, minGen int) (ID, int, error) {
 			t.mu.Lock()
 			err, gen, u := b.err, b.gen, t.urls[i]
 			t.mu.Unlock()
-			if err != nil {
-				return "", 0, err
-			}
+
+			// Check the URL before the error. A mint we waited on belongs to
+			// whoever started it: if it was refreshing a URL that expired for
+			// them and it failed, that is no reason to fail us when the URL
+			// already in the table is new enough for what we asked for.
 			if gen >= minGen {
 				return u, gen, nil
+			}
+			if err != nil {
+				return "", 0, err
 			}
 			// Their mint predates what we need; go around and mint ourselves.
 			continue
@@ -114,7 +118,7 @@ func (t *urlTable) mint(i, minGen int) (ID, int, error) {
 		t.mu.Unlock()
 
 		end := min(start+urlBatchSize, t.parts)
-		urls, err := t.p.fetchURLs(t.fileID, t.checksum, start, end)
+		urls, err := t.mintBatch(start, end)
 
 		t.mu.Lock()
 		if err == nil {
