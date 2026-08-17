@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dt/gosendsafely/util"
@@ -25,6 +26,17 @@ type mockSendSafelyServer struct {
 	userEmail      string
 	validAPIKey    string
 	validAPISecret string
+
+	mu sync.Mutex
+	// gen stamps every minted download URL. expireURLs bumps it, after which
+	// URLs minted earlier are rejected the way S3 rejects an expired
+	// signature. Zero-valued, so tests that don't expire anything are
+	// unaffected.
+	gen int
+	// mints records the [start, end] segment range of each download-urls call.
+	mints [][2]int
+	// downloads counts requests per chunk download path (query excluded).
+	downloads map[string]int
 }
 
 type mockPackage struct {
@@ -49,6 +61,7 @@ func newMockSendSafelyServer() *mockSendSafelyServer {
 		userEmail:      "test@example.com",
 		validAPIKey:    "test-api-key",
 		validAPISecret: "test-api-secret",
+		downloads:      make(map[string]int),
 	}
 
 	mux := http.NewServeMux()
@@ -164,11 +177,16 @@ func (m *mockSendSafelyServer) handlePackage(w http.ResponseWriter, r *http.Requ
 			endSegment = int(v)
 		}
 
+		m.mu.Lock()
+		gen := m.gen
+		m.mints = append(m.mints, [2]int{startSegment, endSegment})
+		m.mu.Unlock()
+
 		downloadUrls := make([]map[string]interface{}, 0)
 		for i := startSegment; i <= min(endSegment, file.parts); i++ {
 			downloadUrls = append(downloadUrls, map[string]interface{}{
 				"part": i,
-				"url":  fmt.Sprintf("%s/download/%s/%s/%d", m.Server.URL, pkg.packageCode, fileID, i-1),
+				"url":  fmt.Sprintf("%s/download/%s/%s/%d?gen=%d", m.Server.URL, pkg.packageCode, fileID, i-1, gen),
 			})
 		}
 
@@ -195,6 +213,23 @@ func (m *mockSendSafelyServer) handleDownload(w http.ResponseWriter, r *http.Req
 	fileID := parts[1]
 	chunkIndex := 0
 	fmt.Sscanf(parts[2], "%d", &chunkIndex)
+
+	m.mu.Lock()
+	m.downloads[r.URL.Path]++
+	gen := m.gen
+	m.mu.Unlock()
+
+	// Reject URLs minted before the last expireURLs call, byte for byte the way
+	// S3 rejects a presigned URL past its deadline.
+	urlGen := 0
+	fmt.Sscanf(r.URL.Query().Get("gen"), "%d", &urlGen)
+	if urlGen < gen {
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
+			`<Error><Code>AccessDenied</Code><Message>Request has expired</Message>`+
+			`<Expires>2026-08-04T21:55:12Z</Expires><ServerTime>2026-08-04T22:47:07Z</ServerTime></Error>`)
+		return
+	}
 
 	pkg, ok := m.packages[packageCode]
 	if !ok {
@@ -232,6 +267,27 @@ func (m *mockSendSafelyServer) validateAuth(r *http.Request) bool {
 
 func (m *mockSendSafelyServer) addPackage(pkg *mockPackage) {
 	m.packages[pkg.packageCode] = pkg
+}
+
+// expireURLs invalidates every download URL minted so far.
+func (m *mockSendSafelyServer) expireURLs() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gen++
+}
+
+// mintCalls returns the segment ranges passed to download-urls so far.
+func (m *mockSendSafelyServer) mintCalls() [][2]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([][2]int(nil), m.mints...)
+}
+
+// downloadCount returns how many times a chunk's URL was requested.
+func (m *mockSendSafelyServer) downloadCount(packageCode, fileID string, chunkIndex int) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.downloads[fmt.Sprintf("/download/%s/%s/%d", packageCode, fileID, chunkIndex)]
 }
 
 // TestOpenPackage_Success tests successfully opening a package and listing files.

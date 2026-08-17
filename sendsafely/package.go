@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -177,55 +178,19 @@ func (p *Package) Open(fileName string) (*File, error) {
 		return nil, fmt.Errorf("file %s not found in package", fileName)
 	}
 
-	// Collect chunk IDs (download URLs)
-	chunkIDs := make([]ID, parts)
-
 	dk, err := pbkdf2.Key(sha256.New, p.keyCode, []byte(p.info.PackageCode), 1024, 32)
 	if err != nil {
 		return nil, err
 	}
 	checksum := hex.EncodeToString(dk)
 
-	const batchSize = 1000
-	for i := 0; i < parts; i += batchSize {
-		urlPath := fmt.Sprintf("/api/v2.0/package/%s/file/%s/download-urls/", p.info.PackageID, fileID)
-
-		body := map[string]interface{}{
-			"checksum":     checksum,
-			"startSegment": i + 1,
-			"endSegment":   min(i+batchSize, parts),
-		}
-		bodyBytes, _ := json.Marshal(body)
-
-		resp, err := p.client.doRequest("POST", urlPath, bodyBytes)
-		if err != nil {
-			return nil, err
-		}
-
-		var dlResp struct {
-			Response     string `json:"response"`
-			DownloadUrls []struct {
-				Part int    `json:"part"`
-				URL  string `json:"url"`
-			} `json:"downloadUrls"`
-		}
-
-		if err := json.Unmarshal(resp, &dlResp); err != nil {
-			return nil, fmt.Errorf("failed to parse download URLs: %w", err)
-		}
-
-		if dlResp.Response != "SUCCESS" {
-			return nil, fmt.Errorf("API returned: %s", dlResp.Response)
-		}
-
-		for j := range dlResp.DownloadUrls {
-			chunkIDs[i+j] = ID(dlResp.DownloadUrls[j].URL)
-		}
-	}
+	// Presigned URLs are minted lazily, a batch at a time, and re-minted when
+	// they expire mid-download. See urlTable.
+	urls := newURLTable(p, fileID, checksum, parts)
 
 	// Pre-fetch first chunk(s) and last chunk to determine actual sizes
 	prefetched := make(map[int][]byte)
-	c0, err := p.fetchAndDecrypt(chunkIDs[0])
+	c0, err := p.fetchSegment(urls, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download chunk 0: %w", err)
 	}
@@ -234,7 +199,7 @@ func (p *Package) Open(fileName string) (*File, error) {
 	// Determine nominal chunk size from chunk 1 (or chunk 0 if only one chunk)
 	nominalSize := len(c0)
 	if parts > 1 {
-		c1, err := p.fetchAndDecrypt(chunkIDs[1])
+		c1, err := p.fetchSegment(urls, 1)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download chunk 1: %w", err)
 		}
@@ -245,15 +210,14 @@ func (p *Package) Open(fileName string) (*File, error) {
 	// Pre-fetch last chunk to verify file size. The API may report trailing
 	// empty chunks; strip them so the last chunk reflects actual data.
 	if parts > 2 {
-		cLast, err := p.fetchAndDecrypt(chunkIDs[parts-1])
+		cLast, err := p.fetchSegment(urls, parts-1)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download last chunk: %w", err)
 		}
 		for len(cLast) == 0 && parts > 2 {
 			delete(prefetched, parts-1)
 			parts--
-			chunkIDs = chunkIDs[:parts]
-			cLast, err = p.fetchAndDecrypt(chunkIDs[parts-1])
+			cLast, err = p.fetchSegment(urls, parts-1)
 			if err != nil {
 				return nil, fmt.Errorf("failed to download last chunk: %w", err)
 			}
@@ -268,14 +232,21 @@ func (p *Package) Open(fileName string) (*File, error) {
 		}
 	}
 
-	// Create file using stream package - it calculates offsets automatically
+	// Create file using stream package - it calculates offsets automatically.
+	// Chunks are keyed by segment index, not by URL, so the fetcher can mint a
+	// fresh URL for a segment whose signature has expired.
+	segments := make([]int, parts)
+	for i := range segments {
+		segments[i] = i
+	}
+
 	file := stream.NewChunkedFile(
 		fileName,
 		fileSize,
-		chunkIDs,
+		segments,
 		nominalSize,
-		func(id ID) ([]byte, error) {
-			return p.fetchAndDecrypt(id)
+		func(i int) ([]byte, error) {
+			return p.fetchSegment(urls, i)
 		},
 		prefetched,
 	)
@@ -296,25 +267,88 @@ func (c *client) fetchAttempt(url ID) ([]byte, error) {
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("failed to download chunk, server reply %d: %s", resp.StatusCode, string(data[:min(200, len(data))]))
+		return nil, &httpError{
+			StatusCode: resp.StatusCode,
+			Body:       string(data[:min(200, len(data))]),
+		}
 	}
 	return data, nil
 }
 
-func (p *Package) fetchAndDecrypt(url ID) ([]byte, error) {
-	var data []byte
-	var err error
-	for i := 0; i < 5; i++ {
-		data, err = p.client.fetchAttempt(url)
-		if err == nil {
-			break
-		}
-		time.Sleep(time.Second)
-	}
-	if err != nil {
-		return nil, err
-	}
+const (
+	// maxFetchAttempts bounds retries of transient failures (5xx, network).
+	maxFetchAttempts = 5
+	// maxURLRefreshes bounds re-mints of an expired URL for one segment, so a
+	// package we're genuinely forbidden from reading can't spin forever.
+	maxURLRefreshes = 3
+)
 
+// fetchSegment downloads and decrypts one segment, re-minting its presigned URL
+// if the signature has expired. Expiry is expected on long downloads: every URL
+// carries a deadline, and a multi-GB file can outlive it.
+//
+// A failure here cancels the whole download, so anything that might be
+// temporary — a 5xx from either endpoint, a network blip, a mint that lost a
+// race — is retried rather than surfaced.
+func (p *Package) fetchSegment(t *urlTable, i int) ([]byte, error) {
+	var (
+		url ID
+		gen int
+		// needGen is the generation the URL must have been minted at. It moves
+		// past the current one when a signature expires.
+		needGen   = 1
+		attempts  int // transient failures spent
+		refreshes int // expired URLs replaced
+	)
+
+	for {
+		if gen < needGen {
+			u, g, err := t.mint(i, needGen)
+			if err != nil {
+				// Minting can fail for reasons that pass: the API 5xx'd, or
+				// another segment's refresh of this batch failed and we're
+				// seeing its error. Spend an attempt, not the download.
+				attempts++
+				if attempts == maxFetchAttempts {
+					return nil, fmt.Errorf("segment %d: get download URL: %w", i+1, err)
+				}
+				time.Sleep(backoff(attempts))
+				continue
+			}
+			url, gen = u, g
+		}
+
+		data, err := p.client.fetchAttempt(url)
+		if err == nil {
+			return p.decrypt(data)
+		}
+
+		var he *httpError
+		switch {
+		case errors.As(err, &he) && he.refreshable():
+			// Retrying the same URL can never recover an expired signature.
+			if refreshes == maxURLRefreshes {
+				return nil, fmt.Errorf("segment %d: still failing after %d URL refreshes: %w", i+1, refreshes, err)
+			}
+			refreshes++
+			needGen = gen + 1
+		case errors.As(err, &he) && he.fatal():
+			return nil, fmt.Errorf("segment %d: %w", i+1, err)
+		default:
+			attempts++
+			if attempts == maxFetchAttempts {
+				return nil, fmt.Errorf("segment %d: %w", i+1, err)
+			}
+			time.Sleep(backoff(attempts))
+		}
+	}
+}
+
+func backoff(attempt int) time.Duration {
+	return min(time.Second<<attempt, 8*time.Second)
+}
+
+func (p *Package) decrypt(data []byte) ([]byte, error) {
 	md, err := openpgp.ReadMessage(bytes.NewReader(data), nil, func(keys []openpgp.Key, symmetric bool) ([]byte, error) {
 		return []byte(p.info.ServerSecret + p.keyCode), nil
 	}, nil)

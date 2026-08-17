@@ -22,9 +22,13 @@ import (
 	"golang.org/x/term"
 )
 
+// ID is a presigned chunk download URL.
 type ID string
 
-type File = stream.ChunkedFile[ID]
+// File is a package file streamed in chunks. Chunks are keyed by zero-based
+// segment index rather than by URL, so an expired presigned URL can be
+// re-minted for the same segment.
+type File = stream.ChunkedFile[int]
 
 type FileInfo struct {
 	Name string
